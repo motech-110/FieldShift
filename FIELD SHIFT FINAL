@@ -1,0 +1,301 @@
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+import fieldshift_engine as fe
+import fieldshift_analysis as fa
+import fieldshift_v3 as v3
+
+st.set_page_config(page_title="FieldShift", page_icon="🌍", layout="wide")
+st.title("🌍 FieldShift: climate-smart crop rotation planner")
+st.caption("NASA Earth observations + your soil + crop traits + your priorities → rotation strategies that build soil health and adapt to changing conditions.")
+
+SITES = {"Kasama (north, wetter)": (-10.21, 31.18), "Choma (south, drier)": (-16.81, 26.99),
+         "Lusaka (central)": (-15.39, 28.28), "Mongu (west)": (-15.25, 23.13), "Custom": None}
+
+@st.cache_data(persist="disk", show_spinner="Fetching 25 years of NASA POWER data (first time per site only)...")
+def get_series(lat, lon):
+    rain, temp = fe.fetch_power(lat, lon, 2001, 2025)
+    return fa.build_series(rain, temp, fa.fetch_wetness(lat, lon))
+
+def load(lat, lon):
+    try:
+        return get_series(lat, lon), False
+    except Exception as e:
+        st.warning(f"Live NASA POWER fetch failed ({e}). Showing SYNTHETIC demo data, not real data.")
+        return fa.demo_series("dry" if lat < -14 else "wet"), True
+
+# ================= MODE SWITCH: Farmer (simple) vs Expert (full) =================
+mode = st.sidebar.radio("View", ["🧑‍🌾 Farmer (simple)", "🔬 Expert (full analysis)"], index=0)
+
+GOALS = {"🌱 Healthy soil for the future": "soil_health", "☔ A safe harvest, even in dry years": "resilience",
+         "💰 More income": "income", "🪙 Spend less": "low_cost", "🍽️ Feed my family": "food_security"}
+
+def farmer_view():
+    st.subheader("🧑‍🌾 Your farm plan in 4 steps")
+    c1, c2 = st.columns(2)
+    name = c1.selectbox("1. Where is your farm?", list(SITES), key="f_site")
+    if SITES[name] is None:
+        lat = c1.number_input("Latitude", value=-15.0, key="f_lat"); lon = c1.number_input("Longitude", value=28.0, key="f_lon")
+    else:
+        lat, lon = SITES[name]
+    prev = c2.selectbox("2. What did you grow last season?", list(v3.CROPS), format_func=str.title, key="f_prev")
+    goal = st.radio("3. What matters most to you?", list(GOALS), key="f_goal")
+    with st.expander("4. Your soil (optional, we assume average soil)"):
+        soil = dict(
+            texture=st.selectbox("Texture", v3.SOIL_OPTIONS["texture"], index=1, key="f_tex"),
+            om=st.selectbox("Organic matter", v3.SOIL_OPTIONS["om"], index=1, key="f_om"),
+            drainage=st.selectbox("Drainage", v3.SOIL_OPTIONS["drainage"], index=1, key="f_dr"),
+            ph=st.selectbox("Acidity", v3.SOIL_OPTIONS["ph"], index=1, key="f_ph",
+                            format_func=lambda x: {"acidic": "Acidic (low pH)", "normal": "Normal"}[x]),
+            slope=st.selectbox("Slope", v3.SOIL_OPTIONS["slope"], index=0, key="f_sl"))
+
+    weights = dict(soil_health=5, resilience=5, income=5, low_cost=5, food_security=5)
+    weights[GOALS[goal]] = 10
+    series_all, synthetic = load(lat, lon)
+    series = series_all[-12:]
+    clim = fa.climate_from(series)
+    base = (1.0, 0.0, 1.0)
+    top, rel = v3.rank(prev, series, v3.CROPS, soil, base, weights, 3)
+    ons = fa.onset_stats(series)
+    best = top[0]; seq = best["seq"]
+    arrow = lambda s: " → ".join(c.title() for c in s)
+
+    if synthetic: st.error("Demo data in use (NASA fetch failed). Do not rely on this plan.")
+    st.divider()
+    st.success(f"## ✅ Plant **{seq[0].title()}** next season")
+    st.markdown(f"**Full plan:** {arrow(seq)}")
+    m = st.columns(4)
+    m[0].metric("Rains usually start", ons["median"] if ons else "n/a")
+    m[1].metric("Do not plant before", ons["early"] if ons else "n/a")
+    m[2].metric("Dry spell in Jan-Feb", f"~{clim['dry_spell_days']:.0f} days")
+    m[3].metric("Plan worked in", f"{round(best['detail']['base'] * 10)} of 10 past years")
+    if ons: st.warning(f"Planting before about {ons['early']} often meant a false start. Wait for steady rain.")
+    with st.expander("Why this plan?"):
+        for ln in v3.explain(best, prev, v3.CROPS, soil, clim, base)[:3]: st.markdown("- " + ln)
+    with st.expander("Other good options"):
+        for r in top[1:]: st.markdown(f"- {arrow(r['seq'])}")
+
+    card = "\n".join([f"FIELDSHIFT FARM PLAN - {name}", f"Last crop: {prev.title()}", "", f"BEST PLAN: {arrow(seq)}",
+                      f"1. Next season plant {seq[0].title()}.",
+                      f"2. Rains usually start around {ons['median']}. Do not plant before about {ons['early']}." if ons else "2. Wait for steady rain before planting.",
+                      f"3. Dry spells of about {clim['dry_spell_days']:.0f} days are common in Jan-Feb. Choose drought-tolerant crops if rains fail.",
+                      f"4. This plan worked in about {best['detail']['base']:.0%} of past seasons.",
+                      "", "Based on NASA satellite climate data. Ask your agricultural extension officer before deciding."])
+    st.download_button("📱 Save plan (for WhatsApp/SMS)", card, file_name="farmer_card.txt")
+    st.caption("Built on 25 years of NASA POWER satellite data. Switch to Expert view (sidebar) for the full analysis, maps and validation.")
+
+if mode.startswith("🧑"):
+    farmer_view()
+    st.stop()
+# ================= END MODE SWITCH =================
+
+# ---------------- Sidebar: the farm ----------------
+with st.sidebar:
+    st.header("📍 Farm location")
+    name = st.selectbox("Site", list(SITES))
+    if SITES[name] is None:
+        lat = st.number_input("Latitude", value=-15.0); lon = st.number_input("Longitude", value=28.0)
+    else:
+        lat, lon = SITES[name]
+    st.header("🪨 Local soil")
+    soil = dict(
+        texture=st.selectbox("Texture", v3.SOIL_OPTIONS["texture"], index=1),
+        om=st.selectbox("Organic matter", v3.SOIL_OPTIONS["om"], index=1),
+        drainage=st.selectbox("Drainage", v3.SOIL_OPTIONS["drainage"], index=1),
+        ph=st.selectbox("Acidity", v3.SOIL_OPTIONS["ph"], index=1, format_func=lambda x: {"acidic": "Acidic (low pH)", "normal": "Normal"}[x]),
+        slope=st.selectbox("Slope", v3.SOIL_OPTIONS["slope"], index=0))
+    prev = st.selectbox("Last season's crop", list(v3.CROPS))
+    st.header("🎯 Your priorities (0-10)")
+    defaults = dict(soil_health=8, resilience=8, income=5, low_cost=4, food_security=5)
+    weights = {k: st.slider(lab, 0, 10, defaults[k]) for k, lab in v3.LABELS.items()}
+    st.header("⏳ Planning")
+    horizon = st.radio("Seasons to plan", [2, 3, 4], index=1, horizontal=True)
+    window = st.slider("Use the most recent N seasons", 5, 24, 12, help="Smaller = reflects the recent climate more.")
+    st.header("🔮 What-if (planning case)")
+    rain_f = st.slider("Rainfall change", 0.6, 1.2, 1.0, 0.05, format="%.2f×")
+    temp_d = st.slider("Warming (°C)", 0.0, 4.0, 0.0, 0.5)
+
+tabs = st.tabs(["🏆 Best rotations", "🔬 Explore & compare", "📈 Climate shift", "🌱 Planting window",
+                "🛰️ NASA satellite view", "🌾 Crop traits", "✅ Validation", "ℹ️ Evidence & limits"])
+
+# Crop traits first, so edits apply to everything below
+with tabs[5]:
+    st.subheader("Crop characteristics (editable)")
+    st.caption("Starting values are placeholders from general agronomy. Replace them with FAO or local extension values; every score updates.")
+    edited = st.data_editor(v3.traits_to_df(v3.CROPS), key="traits")
+crops = v3.df_to_traits(edited, v3.CROPS)
+
+series_all, synthetic = load(lat, lon)
+series = series_all[-window:]
+clim = fa.climate_from(series)
+base = (rain_f, temp_d, 1.0)
+top, rel = v3.rank(prev, series, crops, soil, base, weights, horizon)
+baseline = v3.evaluate(["maize"] * horizon, prev, crops, soil, rel, weights)
+ons = fa.onset_stats(series)
+arrow = lambda seq: " → ".join(c.title() for c in seq)
+pct = lambda x: f"{x:.0%}"
+summary = (f"**{name}**: rainy season (Nov-Apr) averages {clim['rain_mm'] * rain_f:.0f} mm at {clim['temp_c'] + temp_d:.1f} °C over the last "
+           f"{len(series)} seasons, with a typical mid-season dry spell of {clim['dry_spell_days']:.0f} days. "
+           f"Soil: {soil['texture']}, {soil['om']} organic matter, {soil['drainage']} drainage, {soil['slope']} slope. "
+           f"Top strategy after {prev}: **{arrow(top[0]['seq'])}**.")
+
+# ---------------- 1. Best rotations ----------------
+with tabs[0]:
+    if synthetic: st.error("SYNTHETIC demo data in use. Do not present as real.")
+    m = st.columns(4)
+    m[0].metric("Season rain", f"{clim['rain_mm'] * rain_f:.0f} mm"); m[1].metric("Season temp", f"{clim['temp_c'] + temp_d:.1f} °C")
+    m[2].metric("Mid-season dry spell", f"{clim['dry_spell_days']:.0f} days"); m[3].metric("Rains typically start", ons["median"] if ons else "n/a")
+    st.info(summary)
+    report = [f"# FieldShift report: {name}", "", summary.replace("**", ""), "",
+              "Priorities: " + ", ".join(f"{v3.LABELS[k]} {v}/10" for k, v in weights.items()), ""]
+    for i, r in enumerate(top, 1):
+        st.markdown(f"### #{i}  {arrow(r['seq'])}  ·  overall {pct(r['overall'])}")
+        cols = st.columns(5)
+        for col, (k, lab) in zip(cols, v3.LABELS.items()):
+            col.metric(lab, pct(r["comp"][k]), delta=f"{(r['comp'][k] - baseline['comp'][k]) * 100:+.0f} pts")
+        lines = v3.explain(r, prev, crops, soil, clim, base)
+        with st.expander("Why this rotation?"):
+            for ln in lines: st.markdown("- " + ln)
+        report += [f"## #{i} {arrow(r['seq'])} (overall {pct(r['overall'])})"] + ["- " + ln.replace("**", "") for ln in lines] + [""]
+    st.caption("Changes (pts) are compared with continuous maize, the common baseline. Scores are relative indices, not yield or money forecasts.")
+    cmp = {arrow(r["seq"]): {v3.LABELS[k]: round(v * 100) for k, v in r["comp"].items()} for r in top}
+    cmp["Continuous maize"] = {v3.LABELS[k]: round(v * 100) for k, v in baseline["comp"].items()}
+    st.bar_chart(pd.DataFrame(cmp))
+    report += ["## Data and limits", "NASA POWER climate (2001-2025); soil and priorities entered by the farmer; crop traits are placeholders to verify (FAO).",
+               "Scores are relative indices, not yield or price forecasts."]
+    st.download_button("⬇️ Download report", "\n".join(report), file_name="fieldshift_report.md")
+    t0 = top[0]["seq"]
+    card = "\n".join([f"FIELDSHIFT FARM PLAN - {name}", f"Last crop: {prev.title()}  |  Soil: {soil['texture']}, {soil['om']} organic matter, {soil['slope']} slope",
+                      "", f"BEST PLAN: {arrow(t0)}", f"1. Next season plant {t0[0].title()}.",
+                      f"2. Rains usually start around {ons['median']}. Do not plant before about {ons['early']}." if ons else "2. Wait for steady rain before planting.",
+                      f"3. Dry spells of about {clim['dry_spell_days']:.0f} days are common in Jan-Feb. Choose drought-tolerant crops if rains fail.",
+                      f"4. This plan worked in about {top[0]['detail']['base']:.0%} of past seasons ({top[0]['detail']['stress']:.0%} under drier/hotter conditions).",
+                      "", "Based on NASA satellite climate data. Ask your agricultural extension officer before deciding."])
+    st.download_button("📱 Download farmer card (plain text for WhatsApp/SMS)", card, file_name="farmer_card.txt")
+
+# ---------------- 2. Explore & compare ----------------
+with tabs[1]:
+    st.subheader("Build your own rotation and compare")
+    names = list(crops)
+    cols = st.columns(horizon)
+    custom = [cols[i].selectbox(f"Season {i + 1}", names, index=names.index(top[0]["seq"][i]), key=f"cu{horizon}_{i}") for i in range(horizon)]
+    if any(([prev] + custom)[i] == custom[i] for i in range(horizon)):
+        st.warning("Your plan repeats a crop in back-to-back seasons, which raises disease risk and drains soil nutrients.")
+    cand = {"Your rotation": v3.evaluate(custom, prev, crops, soil, rel, weights), "Recommended #1": top[0], "Continuous maize": baseline}
+    tbl = pd.DataFrame({n: {**{v3.LABELS[k]: round(v * 100) for k, v in r["comp"].items()}, "Overall": round(r["overall"] * 100)}
+                        for n, r in cand.items()})
+    st.dataframe(tbl)
+    st.bar_chart(tbl.drop(index="Overall"))
+    st.subheader("Stress test: how often would each strategy work under changing conditions?")
+    st.caption("Share of the last seasons in which the strategy's crops would have worked, with each stress applied on top of your planning case.")
+    st.dataframe(pd.DataFrame({n: {sc: round(v * 100) for sc, v in v3.scenario_reliability(r["seq"], rel).items()}
+                               for n, r in cand.items()}))
+    for ln in v3.explain(cand["Your rotation"], prev, crops, soil, clim, base): st.markdown("- " + ln)
+
+# ---------------- 3. Climate shift ----------------
+with tabs[2]:
+    df = pd.DataFrame(series_all).set_index("season")
+    st.subheader("Is the climate shifting here?")
+    a, b, c = st.columns(3)
+    for col, key, lab, unit in [(a, "total", "Season rainfall", "mm"), (b, "temp", "Mean temperature", "°C"), (c, "spell", "Mid-season dry spell", "days")]:
+        t = fa.trend(series_all, key)
+        col.metric(lab + " trend", f"{t:+.1f} {unit}/decade" if t is not None else "n/a")
+    half = len(series_all) // 2
+    e, l = series_all[:half], series_all[half:]
+    st.write(f"Average rainfall: **{fa.climate_from(e)['rain_mm']:.0f} mm** in {e[0]['season']}-{e[-1]['season']} vs "
+             f"**{fa.climate_from(l)['rain_mm']:.0f} mm** in {l[0]['season']}-{l[-1]['season']}.")
+    st.caption("Season = Nov-Apr. Rainfall varies a lot year to year, so short trends are indicative only.")
+    st.markdown("**Seasonal rainfall (mm)**"); st.bar_chart(df["total"])
+    st.markdown("**Mean season temperature (°C)**"); st.line_chart(df["temp"])
+    st.markdown("**Longest mid-season dry spell (days)**"); st.bar_chart(df["spell"])
+    if df["wet"].notna().any():
+        st.markdown("**Root-zone soil wetness (0-1, NASA POWER model-derived)**"); st.line_chart(df["wet"])
+
+# ---------------- 4. Planting window ----------------
+with tabs[3]:
+    st.subheader("When do the rains really start?")
+    full = fa.onset_stats(series_all)
+    if full:
+        a, b, c = st.columns(3)
+        a.metric("Typical onset", full["median"]); b.metric("Early (1 in 10 years)", full["early"]); c.metric("Late (1 in 10 years)", full["late"])
+        st.write("Rule: at least 20 mm in 3 days after 15 Oct, with no dry spell of 10+ days in the next 30 days.")
+        st.warning(f"Planting before about {full['early']} often meant a false start. Waiting until near {full['median']} is safer; check local forecasts.")
+        st.line_chart(df["onset"].rename("Days after 1 Oct"))
+    else:
+        st.info("Not enough clear onset dates for this site.")
+
+# ---------------- 5. NASA satellite view ----------------
+LAYERS = {"True color (MODIS Terra)": ("MODIS_Terra_CorrectedReflectance_TrueColor", 9, "jpg"),
+          "Vegetation greenness, NDVI 8-day (MODIS Terra)": ("MODIS_Terra_NDVI_8Day", 9, "png"),
+          "Soil moisture, daily (SMAP)": ("SMAP_L3_Passive_Enhanced_Day_Soil_Moisture", 6, "png")}
+with tabs[4]:
+    st.subheader("NASA satellite imagery around your farm")
+    lname = st.selectbox("Layer", list(LAYERS))
+    layer, lvl, ext = LAYERS[lname]
+    components.html(f"""<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><div id="m" style="height:480px"></div><script>
+var m=L.map('m').setView([{lat},{lon}],7);
+L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'©️ OpenStreetMap'}}).addTo(m);
+L.tileLayer('https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/{layer}/default/default/GoogleMapsCompatible_Level{lvl}/{{z}}/{{y}}/{{x}}.{ext}',
+ {{maxNativeZoom:{lvl},maxZoom:12,opacity:0.8,attribution:'NASA GIBS'}}).addTo(m);
+L.marker([{lat},{lon}]).addTo(m);</script>""", height=500)
+    st.caption("Latest available NASA GIBS imagery, for visual context (not used in the scores). If a layer looks blank, try another layer or zoom out. "
+               "Green on the NDVI layer = more vegetation; soil moisture has gaps where there is no recent satellite pass.")
+
+# ---------------- 7. Validation ----------------
+with tabs[6]:
+    st.subheader("Did the NASA data 'see' real drought seasons?")
+    st.caption("Sanity check against documented events (not a yield validation). Season 2023 = the 2023/24 rainy season (Oct 2023 - Apr 2024).")
+    dv = pd.DataFrame(series_all).set_index("season")
+    mz = [v3.season_score(x, crops["maize"], soil, 1.0, 0.0, 1.0) for x in series_all]
+    dv["maize_score"], dv["maize_ok"] = [m[0] for m in mz], [m[1] for m in mz]
+    avg, rows = dv["total"].mean(), []
+    for sea, lab in ((2015, "2015/16 El Niño drought"), (2023, "2023/24 El Niño drought (national disaster, 29 Feb 2024)")):
+        if sea in dv.index:
+            r = dv.loc[sea]
+            rows.append({"Season": lab, "Rain (mm)": round(r["total"]), "vs average": f"{(r['total'] / avg - 1) * 100:+.0f}%",
+                         "Dryness rank (1 = driest)": f"{int(dv['total'].rank(method='min')[sea])} of {len(dv)}",
+                         "Longest dry spell (days)": int(r["spell"]), "Maize would have worked?": "Yes" if r["maize_ok"] else "No"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
+    mark = dv.index.isin([2015, 2023])
+    st.bar_chart(pd.DataFrame({"Maize season score": dv["maize_score"].where(~mark), "Known drought seasons": dv["maize_score"].where(mark)}))
+    st.markdown("""**What was reported:** Zambia declared the 2023/24 drought a national disaster; about 1.1 million of 2.2 million hectares of planted maize were affected
+(84 of 116 districts); the Agriculture Minister said maize output was projected to fall from 3.26 to 1.51 million tonnes, with Southern, Western and Eastern provinces
+hit hardest. The 2015/16 El Niño drought was described as the worst in Southern Africa in about 35 years.
+
+**How to read this:** if the NASA-derived rainfall for the selected site ranks these seasons among the driest, the data agrees with the reports. In sites that were less
+affected (for example the wetter north), a weaker signal is also consistent with the reported pattern. Try Choma and Mongu, then Kasama.""")
+
+# ---------------- 8. Evidence & limits ----------------
+with tabs[7]:
+    st.subheader("How FieldShift answers the challenge")
+    st.dataframe(pd.DataFrame([
+        ["Use NASA Earth observations", "NASA POWER climate (25 yr), NASA GIBS imagery (MODIS, SMAP) in the satellite tab"],
+        ["Local soil information", "Texture, organic matter, drainage, acidity and slope change the scores"],
+        ["Crop characteristics", "Eight editable crop trait profiles (water, temperature, nitrogen, residue, cost, market)"],
+        ["Farmer priorities", "Five priority sliders weight the ranking"],
+        ["Explore rotation strategies", "Ranked 2-4 season plans, build-your-own comparison, stress tests"],
+        ["Strengthen soil health", "Soil health score: nitrogen, residue, cover, variety, disease break"],
+        ["Adapt to changing conditions", "Climate trends, what-if sliders, drier/hotter/erratic stress scenarios"]],
+        columns=["Challenge requirement", "Where in FieldShift"]), hide_index=True)
+    st.subheader("What each part of the result is based on")
+    st.dataframe(pd.DataFrame([
+        ["Rainfall, temperature, dry spells, rain onset", "NASA POWER daily data, 2001-2025", "NASA"],
+        ["Root-zone soil wetness chart", "NASA POWER (model-derived)", "NASA"],
+        ["Satellite imagery (true color, NDVI, SMAP soil moisture)", "NASA GIBS, visual context only", "NASA"],
+        ["Soil texture, organic matter, drainage, acidity, slope", "Entered by the farmer", "Farmer"],
+        ["Last crop and priorities", "Entered by the farmer", "Farmer"],
+        ["Crop water, temperature, nitrogen, residue, cost, market traits", "Placeholders, editable; verify with FAO EcoCrop/GAEZ", "Placeholder"],
+        ["Rotation, resilience and soil-health scores", "Transparent rules computed by FieldShift", "Model"]],
+        columns=["Part", "Source", "Type"]), hide_index=True)
+    st.markdown("""
+**How scoring works:** each rotation gets five 0-100% scores. *Soil health* combines nitrogen balance, crop residue, ground cover
+(counted more on slopes), crop variety and disease break (residue counted more on low-organic-matter soil). *Resilience* checks the
+rotation against every past season and against drier, hotter, dry-and-hot and erratic-rain stress cases. *Income*, *low input cost* and
+*food security* use relative crop traits. Your priority sliders weight the five scores into the overall ranking.
+
+**Limits:** scores are relative indices, not yield or price forecasts. Climate data is area-level and coarser than one plot. Soil is farmer-entered.
+Cassava is a long-season crop; treating it as one season is a simplification. Trend statements over about 24 seasons are indicative. Crop traits need verification before real-world use. Always confirm with local extension officers.
+
+**Next steps:** add SMAP and IMERG time series and NDVI-based field vigor, ISRIC SoilGrids for soil defaults, local prices, and farmer testing.
+""")
